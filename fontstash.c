@@ -22,12 +22,18 @@
 #include <string.h>
 #include <math.h> /* @rlyeh: floorf() */
 
-#include <GL/glew.h>  /* @rlyeh: before including GL. doesnt hurt and makes life better */
 
-#ifdef __MACOSX__
-#include <OpenGL/gl.h>
+// SDL
+#include <SDL.h>
+#ifdef USE_GLEW
+	#include <GL/glew.h>
+#endif
+#ifdef USE_OPENGLES
+	#include <SDL_opengles2.h>
 #else
-#include <GL/gl.h>
+	#define GL_GLEXT_PROTOTYPES
+	#include <SDL_opengl.h>
+	#include <SDL_opengl_glext.h>
 #endif
 
 /* @rlyeh: removed STB_TRUETYPE_IMPLENTATION. We link it externally */
@@ -38,7 +44,7 @@
 #define HASH_LUT_SIZE 256
 #define MAX_ROWS 128
 #define VERT_COUNT (6*128)
-#define VERT_STRIDE (sizeof(float)*4)
+#define VERT_STRIDE (5*sizeof(GLfloat)+4*sizeof(GLubyte))
 
 #define TTFONT_FILE 1
 #define TTFONT_MEM  2
@@ -100,7 +106,7 @@ struct sth_texture
 	// TODO: replace rows with pointer
 	struct sth_row rows[MAX_ROWS];
 	int nrows;
-	float verts[4*VERT_COUNT];
+	unsigned char verts[VERT_COUNT*VERT_STRIDE];
 	int nverts;
 	struct sth_texture* next;
 };
@@ -114,7 +120,15 @@ struct sth_stash
 	struct sth_texture* bm_textures;
 	struct sth_font* fonts;
 	int drawing;
+
+	GLuint shader;
+	GLint mvp_loc;
+	GLuint vbo;
 };
+
+const int FS_VA_POSITION = 0;
+const int FS_VA_TEXCOORD = 1;
+const int FS_VA_COLOR    = 2;
 
 
 
@@ -153,11 +167,44 @@ static unsigned int decutf8(unsigned int* state, unsigned int* codep, unsigned i
 
 
 
+
+static GLint sth_texture_min_filter = GL_LINEAR;
+static GLint sth_texture_mag_filter = GL_LINEAR;
+
 struct sth_stash* sth_create(int cachew, int cacheh)
 {
 	struct sth_stash* stash = NULL;
 	GLubyte* empty_data = NULL;
 	struct sth_texture* texture = NULL;
+
+	GLuint vert_shader, frag_shader;
+	static const char vert_source[] = {
+		"uniform mat4 u_mvp;						\n"
+		"attribute vec3 va_position;				\n"
+		"attribute vec2 va_texcoord;				\n"
+		"attribute vec4 va_color;					\n"
+		"varying vec2 v_texcoord;					\n"
+		"varying vec4 v_color;						\n"
+		"void main() {								\n"
+		"	v_texcoord = va_texcoord;				\n"
+		"	v_color = va_color;						\n"
+		"	gl_Position = u_mvp*vec4(va_position,1.0);\n"
+		"}											\n"
+	};
+	static const char frag_source[] = {
+		"#ifdef GL_ES								\n"
+		"precision mediump float;					\n"
+		"#endif										\n"
+		"uniform sampler2D u_alphamap;				\n"
+		"varying vec2 v_texcoord;					\n"
+		"varying vec4 v_color;						\n"
+		"void main() {								\n"
+		"	float a = texture2D(u_alphamap, v_texcoord).a;\n"
+		"	gl_FragColor = vec4(v_color.rgb, v_color.a*a);\n"
+		"}											\n"
+	};
+	char *source_array[1] = {0};
+	GLint is_compiled;
 
 	// Allocate memory for the font stash.
 	stash = (struct sth_stash*)malloc(sizeof(struct sth_stash));
@@ -165,7 +212,7 @@ struct sth_stash* sth_create(int cachew, int cacheh)
 	memset(stash,0,sizeof(struct sth_stash));
 
 	// Create data for clearing the textures
-	empty_data = malloc(cachew * cacheh);
+	empty_data = (GLubyte*)malloc(cachew * cacheh);
 	if (empty_data == NULL) goto error;
 	memset(empty_data, 0, cachew * cacheh);
 
@@ -185,8 +232,42 @@ struct sth_stash* sth_create(int cachew, int cacheh)
 	if (!texture->id) goto error;
 	glBindTexture(GL_TEXTURE_2D, texture->id);
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, cachew, cacheh, 0, GL_ALPHA, GL_UNSIGNED_BYTE, empty_data);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, sth_texture_min_filter);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, sth_texture_mag_filter);
+
+	// Create shader
+	stash->shader = glCreateProgram();
+
+	vert_shader = glCreateShader(GL_VERTEX_SHADER);
+	source_array[0] = (char*)vert_source;
+	glShaderSource(vert_shader, 1, source_array, NULL);
+	glCompileShader(vert_shader);
+	glGetShaderiv(vert_shader, GL_COMPILE_STATUS, &is_compiled);
+	//printf("compiled: %d\n", is_compiled);
+	assert(is_compiled);
+	glAttachShader(stash->shader, vert_shader);
+
+	frag_shader = glCreateShader(GL_FRAGMENT_SHADER);
+	source_array[0] = (char*)frag_source;
+	glShaderSource(frag_shader, 1, source_array, NULL);
+	glCompileShader(frag_shader);
+	glGetShaderiv(frag_shader, GL_COMPILE_STATUS, &is_compiled);
+	//printf("compiled: %d\n", is_compiled);
+	assert(is_compiled);
+	glAttachShader(stash->shader, frag_shader);
+
+	glBindAttribLocation(stash->shader, FS_VA_POSITION, "va_position");
+	glBindAttribLocation(stash->shader, FS_VA_TEXCOORD, "va_texcoord");
+	glBindAttribLocation(stash->shader, FS_VA_COLOR,    "va_color");
+	glLinkProgram(stash->shader);
+	glUseProgram(stash->shader);
+	stash->mvp_loc = glGetUniformLocation(stash->shader, "u_mvp");
+	glUniform1i(glGetUniformLocation(stash->shader, "u_alphamap"), 0);
+
+	// Create vbo
+	glGenBuffers(1, &stash->vbo);
+	glBindBuffer(GL_ARRAY_BUFFER, stash->vbo);
+	glBufferData(GL_ARRAY_BUFFER, VERT_COUNT * VERT_STRIDE, NULL, GL_STREAM_DRAW);
 
 	return stash;
 	
@@ -492,8 +573,8 @@ static struct sth_glyph* get_glyph(struct sth_stash* stash, struct sth_font* fnt
 						if (!texture->id) goto error;
 						glBindTexture(GL_TEXTURE_2D, texture->id);
 						glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, stash->tw,stash->th, 0, GL_ALPHA, GL_UNSIGNED_BYTE, stash->empty_data);
-						glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-						glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+						glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, sth_texture_min_filter);
+						glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, sth_texture_mag_filter);
 					}
 					continue;
 				}
@@ -580,33 +661,53 @@ static int get_quad(struct sth_stash* stash, struct sth_font* fnt, struct sth_gl
 	return 1;
 }
 
-static float* setv(float* v, float x, float y, float s, float t)
+static unsigned char* setv(unsigned char* v,
+	float x, float y, float z,
+	float s, float t,
+	float *color)
 {
-	v[0] = x;
-	v[1] = y;
-	v[2] = s;
-	v[3] = t;
-	return v+4;
+	float *fv = (float*)v;
+	fv[0] = x;
+	fv[1] = y;
+	fv[2] = z;
+	fv[3] = s;
+	fv[4] = t;
+	v[20] = (unsigned char)(255.0f * color[0]);
+	v[21] = (unsigned char)(255.0f * color[1]);
+	v[22] = (unsigned char)(255.0f * color[2]);
+	v[23] = (unsigned char)(255.0f * color[3]);
+	return v+VERT_STRIDE;
 }
 
 static void flush_draw(struct sth_stash* stash)
 {
+	glUseProgram(stash->shader);
+
 	struct sth_texture* texture = stash->tt_textures;
 	short tt = 1;
 	while (texture)
 	{
 		if (texture->nverts > 0)
-		{			
+		{
+			// fill vbo
+			glBindBuffer(GL_ARRAY_BUFFER, stash->vbo);
+			glBufferSubData(GL_ARRAY_BUFFER, 0, texture->nverts*VERT_STRIDE, texture->verts);
+
 			glBindTexture(GL_TEXTURE_2D, texture->id);
-			glEnable(GL_TEXTURE_2D);
-			glEnableClientState(GL_VERTEX_ARRAY);
-			glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-			glVertexPointer(2, GL_FLOAT, VERT_STRIDE, texture->verts);
-			glTexCoordPointer(2, GL_FLOAT, VERT_STRIDE, texture->verts+2);
-			glDrawArrays(GL_QUADS, 0, texture->nverts);
-			glDisable(GL_TEXTURE_2D);
-			glDisableClientState(GL_VERTEX_ARRAY);
-			glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+
+			glEnableVertexAttribArray((GLuint)FS_VA_POSITION);
+			glVertexAttribPointer((GLuint)FS_VA_POSITION, 3, GL_FLOAT, GL_FALSE, VERT_STRIDE, (GLvoid*)0);
+			glEnableVertexAttribArray((GLuint)FS_VA_TEXCOORD);
+			glVertexAttribPointer((GLuint)FS_VA_TEXCOORD, 2, GL_FLOAT, GL_FALSE, VERT_STRIDE, (GLvoid*)(3*sizeof(float)));
+			glEnableVertexAttribArray((GLuint)FS_VA_COLOR);
+			glVertexAttribPointer((GLuint)FS_VA_COLOR, 4, GL_UNSIGNED_BYTE, GL_TRUE, VERT_STRIDE, (GLvoid*)(5*sizeof(float)));
+
+			glDrawArrays(GL_TRIANGLES, 0, texture->nverts);
+
+			glDisableVertexAttribArray((GLuint)FS_VA_POSITION);
+			glDisableVertexAttribArray((GLuint)FS_VA_TEXCOORD);
+			glDisableVertexAttribArray((GLuint)FS_VA_COLOR);
+
 			texture->nverts = 0;
 		}
 		texture = texture->next;
@@ -616,15 +717,21 @@ static void flush_draw(struct sth_stash* stash)
 			tt = 0;
 		}
 	}
+
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glUseProgram(0);
 }
 
-void sth_begin_draw(struct sth_stash* stash)
+void sth_begin_draw(struct sth_stash* stash, float *mvp)
 {
 	if (stash == NULL)
         return;
 	if (stash->drawing)
 		flush_draw(stash);
 	stash->drawing = 1;
+	glUseProgram(stash->shader);
+	glUniformMatrix4fv(stash->mvp_loc, 1, GL_FALSE, mvp);
 }
 
 void sth_end_draw(struct sth_stash* stash)
@@ -658,18 +765,20 @@ void sth_end_draw(struct sth_stash* stash)
 }
 
 void sth_draw_text(struct sth_stash* stash,
-				   int idx, float size,
-				   float x, float y,
-				   const char* s, float* dx)
+				   int idx, float size, float pixel_scale,
+				   float* pos, float *color, const char* s, float* dx)
 {
 	unsigned int codepoint;
 	struct sth_glyph* glyph = NULL;
 	struct sth_texture* texture = NULL;
 	unsigned int state = 0;
 	struct sth_quad q;
-	short isize = (short)(size*10.0f);
-	float* v;
+	short isize = (short)(size*pixel_scale*10.0f);
+	unsigned char* v;
 	struct sth_font* fnt = NULL;
+	float x = pos[0];
+	float y = pos[1];
+	float z = pos[2];
 	
 	if (stash == NULL)
         return;
@@ -689,20 +798,41 @@ void sth_draw_text(struct sth_stash* stash,
 		if (!glyph)
             continue;
 		texture = glyph->texture;
-		if (texture->nverts+4 >= VERT_COUNT)
+		if (texture->nverts+6 >= VERT_COUNT)
 			flush_draw(stash);
 		
+        float old_x = x, old_y = y;
 		if (!get_quad(stash, fnt, glyph, isize, &x, &y, &q))
             continue;
+
+		// scale quad geometry
+		x = old_x + (x - old_x) / pixel_scale;
+		y = old_y + (y - old_y) / pixel_scale;
+		q.x0 = old_x + (q.x0 - old_x) / pixel_scale;
+		q.x1 = old_x + (q.x1 - old_x) / pixel_scale;
+		q.y0 = old_y + (q.y0 - old_y) / pixel_scale;
+		q.y1 = old_y + (q.y1 - old_y) / pixel_scale;
 		
-		v = &texture->verts[texture->nverts*4];
+		v = &texture->verts[texture->nverts*VERT_STRIDE];
 		
+#if 0 /* quads */
 		v = setv(v, q.x0, q.y0, q.s0, q.t0);
 		v = setv(v, q.x1, q.y0, q.s1, q.t0);
 		v = setv(v, q.x1, q.y1, q.s1, q.t1);
 		v = setv(v, q.x0, q.y1, q.s0, q.t1);
 		
 		texture->nverts += 4;
+#else /* triangles */
+		v = setv(v, q.x0, q.y0, z, q.s0, q.t0, color);
+		v = setv(v, q.x0, q.y1, z, q.s0, q.t1, color);
+		v = setv(v, q.x1, q.y1, z, q.s1, q.t1, color);
+
+		v = setv(v, q.x1, q.y1, z, q.s1, q.t1, color);
+		v = setv(v, q.x1, q.y0, z, q.s1, q.t0, color);
+		v = setv(v, q.x0, q.y0, z, q.s0, q.t0, color);
+
+		texture->nverts += 6;
+#endif
 	}
 	
 	if (dx) *dx = x;
